@@ -150,11 +150,13 @@ RUN PACKAGE_FILE="${COMPANY_NAME}-${PRODUCT_NAME}${PRODUCT_EDITION}${PACKAGE_VER
 COPY config/supervisor/supervisord.rootless.conf /app/defaults/etc/supervisor/supervisord.conf
 
 RUN set -eux; \
-    # Run pluginsmanager at build time (as root): it materializes
-    # web-apps/apps/api/documents/api.js from api.js.tpl + plugin list.
-    # At runtime the rootfs is read-only, so api.js must already exist.
-    documentserver-pluginsmanager.sh -r false --k8s true \
-        --update=/var/www/$COMPANY_NAME/documentserver/sdkjs-plugins/plugin-list-default.json && \
+    # Materialize editor entry point at build time: documentserver-flush-cache.sh
+    # copies api.js.tpl → api.js and stamps the cache hash. It also tries to write
+    # /etc/nginx/includes/ds-cache.conf — we ensure that dir exists so the script
+    # runs cleanly even though nginx isn't used at runtime.
+    mkdir -p /etc/nginx/includes && \
+    documentserver-flush-cache.sh -r false && \
+    test -s /var/www/$COMPANY_NAME/documentserver/web-apps/apps/api/documents/api.js && \
     groupmod -g 1001 ds && usermod -u 1001 -g 1001 ds && \
     mkdir -p /app/defaults/etc /app/defaults/log /app/defaults/lib && \
     mv /etc/$COMPANY_NAME          /app/defaults/etc/$COMPANY_NAME && \
