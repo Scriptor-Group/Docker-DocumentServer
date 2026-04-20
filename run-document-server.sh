@@ -2,6 +2,18 @@
 
 umask 0022
 
+# Rootless: seed writable state into /tmp (single emptyDir). The image has
+# symlinks (e.g. /etc/onlyoffice → /tmp/etc/onlyoffice) so everything that
+# the script below mutates at runtime lands on the writable mount.
+seed_tmp() {
+  mkdir -p /tmp/etc /tmp/log /tmp/lib /tmp/cache /tmp/run /tmp/ca-ds /tmp/.cache
+  cp -rn /app/defaults/etc/.   /tmp/etc/   2>/dev/null || true
+  cp -rn /app/defaults/log/.   /tmp/log/   2>/dev/null || true
+  cp -rn /app/defaults/lib/.   /tmp/lib/   2>/dev/null || true
+  cp -rn /app/defaults/cache/. /tmp/cache/ 2>/dev/null || true
+}
+seed_tmp
+
 start_process() {
   "$@" &
   CHILD=$!; wait "$CHILD"; CHILD="";
@@ -11,7 +23,7 @@ function clean_exit {
   [[ -z "$CHILD" ]] || kill -s SIGTERM "$CHILD" 2>/dev/null
   if [ ${ONLYOFFICE_DATA_CONTAINER} == "false" ] && \
   [ ${ONLYOFFICE_DATA_CONTAINER_HOST} == "localhost" ]; then
-    /usr/bin/documentserver-prepare4shutdown.sh
+    /usr/bin/documentserver-prepare4shutdown.sh 2>/dev/null || true
   fi
   exit
 }
@@ -713,7 +725,9 @@ if [ ${ONLYOFFICE_DATA_CONTAINER_HOST} = "localhost" ]; then
     update_statsd_settings
   fi
 
-  update_welcome_page
+  # Rootless: update_welcome_page sed -i's /var/www/.../welcome/*.html on the
+  # read-only rootfs — skip.
+  # update_welcome_page
 
   update_log_settings
 
@@ -802,41 +816,24 @@ if [ ${ONLYOFFICE_DATA_CONTAINER} != "true" ]; then
     update_release_date
   fi
 
-  update_nginx_settings
-  
   if [ "${PLUGINS_ENABLED}" = "true" ]; then
     ( documentserver-pluginsmanager.sh -r false --update="${APP_DIR}/sdkjs-plugins/plugin-list-default.json" >/dev/null; echo "[pluginsmanager] Plugins initialization finished" >/proc/1/fd/1 ) &
   fi
 
   ${ADMINPANEL_AVAILABLE} && [ "${ADMINPANEL_ENABLED:-false}" = "true" ] && sed -i 's,autostart=false,autostart=true,' ${SUPERVISOR_CONF_DIR}/ds-adminpanel.conf
   [ "${EXAMPLE_ENABLED:-false}" = "true" ] && sed -i 's,autostart=false,autostart=true,' ${SUPERVISOR_CONF_DIR}/ds-example.conf
-  service supervisor start
-  
-  # start cron to enable log rotating
-  update_logrotate_settings
-  service cron start
+  # Rootless: run supervisord directly. Nginx is removed (docservice exposed on :8000).
+  # cron is dropped — handle log rotation at the orchestrator level.
+  supervisord -c /etc/supervisor/supervisord.conf
 fi
 
-# Fix to resolve the `unknown "cache_tag" variable` error
-start_process documentserver-flush-cache.sh -r false
+# Rootless: the following scripts all write under /var/www/onlyoffice/documentserver
+# or /etc/nginx (read-only rootfs) — skipped.
+#   documentserver-flush-cache.sh     : updates nginx cache_tag (nginx removed)
+#   documentserver-generate-allfonts  : regenerates AllFonts.js + chown's binaries
+#   documentserver-static-gzip        : creates .gz alongside static assets
+# Let's Encrypt is skipped too: TLS must be terminated upstream.
 
-# nginx used as a proxy, and as data container status service.
-# it run in all cases.
-service nginx start
-
-if [ "${LETS_ENCRYPT_DOMAIN}" != "" -a "${LETS_ENCRYPT_MAIL}" != "" ]; then
-  if [ ! -f "${SSL_CERTIFICATE_PATH}" -a ! -f "${SSL_KEY_PATH}" ]; then
-    start_process documentserver-letsencrypt.sh ${LETS_ENCRYPT_MAIL} ${LETS_ENCRYPT_DOMAIN}
-  fi
-fi
-
-# Regenerate the fonts list and the fonts thumbnails
-if [ "${GENERATE_FONTS}" == "true" ]; then
-  start_process documentserver-generate-allfonts.sh ${ONLYOFFICE_DATA_CONTAINER}
-fi
-
-start_process documentserver-static-gzip.sh ${ONLYOFFICE_DATA_CONTAINER}
-
-echo "${JWT_MESSAGE}" 
+echo "${JWT_MESSAGE}"
 
 start_process bash -c "find '$DS_LOG_DIR' '$DS_LOG_DIR-example' -type f -name '*.log' | xargs tail -F"

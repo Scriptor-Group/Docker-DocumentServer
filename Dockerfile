@@ -102,7 +102,7 @@ COPY config/supervisor/ds/*.conf /etc/supervisor/conf.d/
 COPY run-document-server.sh /app/ds/run-document-server.sh
 COPY oracle/sqlplus /usr/bin/sqlplus
 
-EXPOSE 80 443
+EXPOSE 8000
 
 ARG COMPANY_NAME=onlyoffice
 ARG PRODUCT_NAME=documentserver
@@ -115,7 +115,9 @@ ENV COMPANY_NAME=$COMPANY_NAME \
     PRODUCT_NAME=$PRODUCT_NAME \
     PRODUCT_EDITION=$PRODUCT_EDITION \
     DS_PLUGIN_INSTALLATION=false \
-    DS_DOCKER_INSTALLATION=true
+    DS_DOCKER_INSTALLATION=true \
+    PLUGINS_ENABLED=false \
+    GENERATE_FONTS=false
 
 RUN PACKAGE_FILE="${COMPANY_NAME}-${PRODUCT_NAME}${PRODUCT_EDITION}${PACKAGE_VERSION:+_$PACKAGE_VERSION}_${TARGETARCH:-$(dpkg --print-architecture)}.deb" && \
     wget -q -P /tmp "$PACKAGE_BASEURL/$PACKAGE_FILE" && \
@@ -138,6 +140,34 @@ RUN PACKAGE_FILE="${COMPANY_NAME}-${PRODUCT_NAME}${PRODUCT_EDITION}${PACKAGE_VER
     rm -rf /var/log/$COMPANY_NAME && \
     rm -rf /var/lib/apt/lists/*
 
-VOLUME /var/log/$COMPANY_NAME /var/lib/$COMPANY_NAME /var/www/$COMPANY_NAME/Data /var/lib/postgresql /var/lib/rabbitmq /var/lib/redis /usr/share/fonts/truetype/custom
+# --- Rootless hardening ------------------------------------------------------
+# Normalize the `ds` user to UID/GID 1001, move every path the runtime needs
+# to write to into /app/defaults/, then symlink each original location to
+# /tmp/... so the container can run with:
+#   runAsNonRoot / runAsUser 1001 / readOnlyRootFilesystem / drop ALL caps
+# and a single emptyDir mounted on /tmp (plus a PVC on /var/www/.../Data).
+# Nginx is not used in this deployment — docservice is exposed directly on 8000.
+COPY config/supervisor/supervisord.rootless.conf /app/defaults/etc/supervisor/supervisord.conf
+
+RUN set -eux; \
+    groupmod -g 1001 ds && usermod -u 1001 -g 1001 ds && \
+    mkdir -p /app/defaults/etc /app/defaults/log /app/defaults/lib && \
+    mv /etc/$COMPANY_NAME          /app/defaults/etc/$COMPANY_NAME && \
+    cp -rn /etc/supervisor/.       /app/defaults/etc/supervisor/ && \
+    rm -rf /etc/supervisor && \
+    ([ -d /var/lib/$COMPANY_NAME ] && mv /var/lib/$COMPANY_NAME /app/defaults/lib/$COMPANY_NAME || mkdir -p /app/defaults/lib/$COMPANY_NAME) && \
+    mkdir -p /app/defaults/log/$COMPANY_NAME /app/defaults/log/supervisor && \
+    ln -s /tmp/etc/$COMPANY_NAME   /etc/$COMPANY_NAME && \
+    ln -s /tmp/etc/supervisor      /etc/supervisor && \
+    rm -rf /var/log/$COMPANY_NAME  && ln -s /tmp/log/$COMPANY_NAME /var/log/$COMPANY_NAME && \
+    rm -rf /var/log/supervisor     && ln -s /tmp/log/supervisor    /var/log/supervisor && \
+    ln -s /tmp/lib/$COMPANY_NAME   /var/lib/$COMPANY_NAME && \
+    rm -rf /run                    && ln -s /tmp/run               /run && \
+    mkdir -p /usr/share/ca-certificates && ln -s /tmp/ca-ds /usr/share/ca-certificates/ds && \
+    chown -R 1001:1001 /app /var/www/$COMPANY_NAME
+
+VOLUME /var/www/$COMPANY_NAME/Data /usr/share/fonts/truetype/custom
+
+USER 1001
 
 ENTRYPOINT ["/app/ds/run-document-server.sh"]
