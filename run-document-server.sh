@@ -811,6 +811,8 @@ if [ ${ONLYOFFICE_DATA_CONTAINER} != "true" ]; then
     update_release_date
   fi
 
+  update_nginx_settings
+
   if [ "${PLUGINS_ENABLED}" = "true" ]; then
     ( documentserver-pluginsmanager.sh -r false --update="${APP_DIR}/sdkjs-plugins/plugin-list-default.json" >/dev/null; echo "[pluginsmanager] Plugins initialization finished" >/proc/1/fd/1 ) &
   fi

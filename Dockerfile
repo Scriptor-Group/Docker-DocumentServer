@@ -102,7 +102,7 @@ COPY config/supervisor/ds/*.conf /etc/supervisor/conf.d/
 COPY run-document-server.sh /app/ds/run-document-server.sh
 COPY oracle/sqlplus /usr/bin/sqlplus
 
-EXPOSE 8000
+EXPOSE 8080
 
 ARG COMPANY_NAME=onlyoffice
 ARG PRODUCT_NAME=documentserver
@@ -141,38 +141,58 @@ RUN PACKAGE_FILE="${COMPANY_NAME}-${PRODUCT_NAME}${PRODUCT_EDITION}${PACKAGE_VER
     rm -rf /var/lib/apt/lists/*
 
 # --- Rootless hardening ------------------------------------------------------
-# Normalize the `ds` user to UID/GID 1001, move every path the runtime needs
-# to write to into /app/defaults/, then symlink each original location to
-# /tmp/... so the container can run with:
-#   runAsNonRoot / runAsUser 1001 / readOnlyRootFilesystem / drop ALL caps
-# and a single emptyDir mounted on /tmp (plus a PVC on /var/www/.../Data).
-# Nginx is not used in this deployment — docservice is exposed directly on 8000.
+# Normalize `ds` to UID/GID 1001, move every runtime-writable path into
+# /app/defaults/ and symlink each original location to /tmp/... so the
+# container can run with runAsNonRoot / readOnlyRootFilesystem / cap drop ALL
+# and a single emptyDir on /tmp (plus a PVC on /var/www/.../Data).
+#
+# Nginx stays in front of docservice (it owns the ONLYOFFICE version-prefix
+# rewrite and the /web-apps alias rules). Ports: nginx :8000 (external),
+# docservice :8001 (localhost only).
 COPY config/supervisor/supervisord.rootless.conf /app/defaults/etc/supervisor/supervisord.conf
 
 RUN set -eux; \
-    # Bake editor runtime artifacts at build time (rootfs is read-only at runtime):
-    #   - AllFonts.js, font thumbnails, font_selection.bin, x2t JS caches
-    #   - api.js (from api.js.tpl, with cache hash stamped in)
-    # Args "true true" = skip the script's own supervisorctl restart & chown steps.
+    # Bake editor runtime artifacts at build time (rootfs is RO at runtime).
     documentserver-generate-allfonts.sh true true && \
     mkdir -p /etc/nginx/includes && \
     documentserver-flush-cache.sh -r false && \
     test -s /var/www/$COMPANY_NAME/documentserver/sdkjs/common/AllFonts.js && \
     test -s /var/www/$COMPANY_NAME/documentserver/web-apps/apps/api/documents/api.js && \
+    # Move docservice from :8000 to :8001 so nginx can own :8000 externally.
+    /var/www/$COMPANY_NAME/documentserver/npm/json -I \
+        -f /etc/$COMPANY_NAME/documentserver/local.json \
+        -e "this.services=this.services||{}; this.services.CoAuthoring=this.services.CoAuthoring||{}; this.services.CoAuthoring.server=this.services.CoAuthoring.server||{}; this.services.CoAuthoring.server.port=8001" && \
+    sed -i 's|server localhost:8000|server localhost:8001|g' \
+        /etc/$COMPANY_NAME/documentserver/nginx/includes/http-common.conf && \
     groupmod -g 1001 ds && usermod -u 1001 -g 1001 ds && \
-    mkdir -p /app/defaults/etc /app/defaults/log /app/defaults/lib && \
+    mkdir -p /app/defaults/etc /app/defaults/log /app/defaults/lib /app/defaults/cache && \
     mv /etc/$COMPANY_NAME          /app/defaults/etc/$COMPANY_NAME && \
+    mv /etc/nginx                  /app/defaults/etc/nginx && \
     cp -rn /etc/supervisor/.       /app/defaults/etc/supervisor/ && \
     rm -rf /etc/supervisor && \
     ([ -d /var/lib/$COMPANY_NAME ] && mv /var/lib/$COMPANY_NAME /app/defaults/lib/$COMPANY_NAME || mkdir -p /app/defaults/lib/$COMPANY_NAME) && \
-    mkdir -p /app/defaults/log/$COMPANY_NAME /app/defaults/log/supervisor && \
+    ([ -d /var/lib/nginx ]          && mv /var/lib/nginx         /app/defaults/lib/nginx         || mkdir -p /app/defaults/lib/nginx) && \
+    ([ -d /var/cache/nginx ]        && mv /var/cache/nginx       /app/defaults/cache/nginx       || mkdir -p /app/defaults/cache/nginx) && \
+    mkdir -p /app/defaults/log/$COMPANY_NAME /app/defaults/log/nginx /app/defaults/log/supervisor && \
     ln -s /tmp/etc/$COMPANY_NAME   /etc/$COMPANY_NAME && \
+    ln -s /tmp/etc/nginx           /etc/nginx && \
     ln -s /tmp/etc/supervisor      /etc/supervisor && \
     rm -rf /var/log/$COMPANY_NAME  && ln -s /tmp/log/$COMPANY_NAME /var/log/$COMPANY_NAME && \
+    rm -rf /var/log/nginx          && ln -s /tmp/log/nginx         /var/log/nginx && \
     rm -rf /var/log/supervisor     && ln -s /tmp/log/supervisor    /var/log/supervisor && \
     ln -s /tmp/lib/$COMPANY_NAME   /var/lib/$COMPANY_NAME && \
+    ln -s /tmp/lib/nginx           /var/lib/nginx && \
+    ln -s /tmp/cache/nginx         /var/cache/nginx && \
     rm -rf /run                    && ln -s /tmp/run               /run && \
     mkdir -p /usr/share/ca-certificates && ln -s /tmp/ca-ds /usr/share/ca-certificates/ds && \
+    # Nginx rootless: no master setuid, pid outside /tmp/run (K8s SA secret
+    # hijacks that dir with perms we can't write), bind on 8000 instead of 80.
+    sed -i 's|^\s*user .*|# user disabled for rootless|' /app/defaults/etc/nginx/nginx.conf && \
+    sed -i 's|^\s*pid .*|pid /tmp/nginx.pid;|'           /app/defaults/etc/nginx/nginx.conf && \
+    find /app/defaults/etc/nginx /app/defaults/etc/$COMPANY_NAME -type f \( -name '*.conf' -o -name '*.tmpl' \) \
+        -exec sed -i -E \
+            -e 's/(listen\s+[^ ;]+):80\b/\1:8000/g' \
+            -e 's/(listen\s+)80\b/\18000/g' {} + && \
     chown -R 1001:1001 /app /var/www/$COMPANY_NAME
 
 VOLUME /var/www/$COMPANY_NAME/Data /usr/share/fonts/truetype/custom
