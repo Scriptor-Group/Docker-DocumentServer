@@ -706,16 +706,10 @@ for i in ${DS_LIB_DIR}/App_Data/cache/files ${DS_LIB_DIR}/App_Data/docbuilder ${
   mkdir -p "$i"
 done
 
-# change folder rights
-chown ds:ds "${DATA_DIR}"
-for i in ${DS_LOG_DIR} ${DS_LOG_DIR}-example ${LIB_DIR}; do
-  chown -R ds:ds "$i"
-  chmod -R 755 "$i"
-done
-
-# Bug 75324 - Update permissions for runtime.json
+# Rootless: ownership is already set at build time (UID 1001) and K8s fsGroup
+# covers volumes. chown'ing the PVC fails (not owner) and chown'ing the
+# /var/lib/onlyoffice symlink errors on the read-only rootfs — both are noise.
 AI_CONFIG_FILE="${DATA_DIR}/runtime.json"
-[ -f "${AI_CONFIG_FILE}" ] && { chown ds:ds "${AI_CONFIG_FILE}" && chmod 644 "${AI_CONFIG_FILE}"; }
 
 if [ ${ONLYOFFICE_DATA_CONTAINER_HOST} = "localhost" ]; then
 
@@ -791,7 +785,8 @@ else
   update_welcome_page
 fi
 
-find /etc/${COMPANY_NAME} ! -path '*logrotate*' -exec chown ds:ds {} \;
+# Rootless: ownership already correct (seed_tmp populates /tmp/etc/onlyoffice
+# from /app/defaults/ which was pre-chowned at build time).
 
 #start needed local services
 for i in ${LOCAL_SERVICES[@]}; do
